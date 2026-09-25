@@ -1,0 +1,19 @@
+# Domains the agent user may reach, through the local proxy only; each
+# entry also allows its subdomains. Everything else is refused.
+# Source code and releases
+github.com
+githubusercontent.com
+# Language package registries
+crates.io
+pypi.org
+pythonhosted.org
+npmjs.org
+# Container registries
+quay.io
+registry.redhat.io
+registry.access.redhat.com
+ghcr.io
+registry.fedoraproject.org
+# Distribution mirrors
+fedoraproject.org
+centos.org
