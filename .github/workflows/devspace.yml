@@ -47,6 +47,9 @@ jobs:
           sudo dnf install -y iptables openssh-server
           sudo ln -sfn /usr/local/bin/tailscale /usr/bin/tailscale
           sudo ln -sfn /usr/local/bin/tailscaled /usr/bin/tailscaled
+          # Cockpit listens on all addresses, so other devspaces on the
+          # tailnet could reach its login page; nothing here uses it.
+          sudo systemctl disable --now cockpit.socket 2>/dev/null || true
           sudo systemctl stop sshd.service
           if sudo systemctl cat sshd.socket >/dev/null 2>&1; then
             sudo systemctl stop sshd.socket
@@ -94,11 +97,23 @@ jobs:
           set -euo pipefail
           sed -e 's/#.*//' packages.txt | xargs sudo dnf install -y
 
-      - name: Initialize runner configuration
+      # SSH sessions run as this user, which has no sudo; see the script.
+      - name: Create the unprivileged agent user
         shell: bash
         run: |
           set -euo pipefail
-          sudo -u runner -H just init
+          sudo node scripts/setup-agent-user.mjs
+
+      - name: Initialize agent configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A fixed environment: sudo's PAM session would add the image's
+          # /etc/environment (runner's XDG_RUNTIME_DIR). The checkout is
+          # private to runner, so the Justfile comes on stdin.
+          # shellcheck disable=SC2024 # the redirect is meant to read as runner
+          sudo -u agent env -i HOME=/home/agent USER=agent LOGNAME=agent LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin \
+            bash -c 'set -euo pipefail; f=$(mktemp); trap "rm -f $f" EXIT; cat >"$f"; just --justfile "$f" --working-directory "$HOME" init' <Justfile
 
       - name: Prepare OpenSSH and keep the devspace available
         shell: bash
@@ -107,13 +122,24 @@ jobs:
           SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
         run: |
           set -euo pipefail
+          # The Tailscale login above was the one use of the OIDC request
+          # token. This step lives as long as the devspace, so rerun it
+          # without the token (and the runtime token, where present): its
+          # /proc/PID/environ would show them to anything running as runner.
+          scrub=(ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN)
+          for var in "${scrub[@]}"; do
+            if [[ -v "$var" ]]; then
+              exec env "${scrub[@]/#/--unset=}" bash --noprofile --norc -e -o pipefail "$0"
+            fi
+          done
           [[ -n "$SSH_PUBLIC_KEY" && "$SSH_PUBLIC_KEY" != *$'\n'* && "$SSH_PUBLIC_KEY" != *$'\r'* ]]
           [[ "$SSH_PUBLIC_KEY" =~ ^ssh-ed25519[[:space:]]+[A-Za-z0-9+/]+={0,2}([[:space:]][^[:cntrl:]]*)?$ ]]
           [[ "$(getenforce)" == Enforcing ]]
           duration_seconds=$((DURATION_MINUTES * 60))
           config=$(mktemp)
           key_input=$(mktemp)
-          authorized_key=/home/runner/.ssh/devspace-authorized_keys
+          # Root-owned, so the session can't add keys of its own.
+          authorized_key=/etc/ssh/devspace-authorized_keys
           cleanup() {
             rm -f "$config" "$key_input"
             sudo rm -f "$authorized_key"
@@ -121,10 +147,8 @@ jobs:
           trap cleanup EXIT INT TERM
           printf '%s\n' "$SSH_PUBLIC_KEY" >"$key_input"
           sudo ssh-keygen -lf "$key_input" >/dev/null
-          sudo install -d -m 700 -o runner -g runner /home/runner/.ssh
-          sudo chmod 755 /home/runner
-          sudo install -m 600 -o runner -g runner "$key_input" "$authorized_key"
-          sudo restorecon -RF /home/runner/.ssh
+          sudo install -m 644 -o root -g root "$key_input" "$authorized_key"
+          sudo restorecon "$authorized_key"
           sudo ssh-keygen -A
           tailscale_ip=$(sudo tailscale ip -4)
           [[ "$tailscale_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
@@ -132,14 +156,17 @@ jobs:
           Port 22
           ListenAddress $tailscale_ip
           HostKey /etc/ssh/ssh_host_ed25519_key
-          AuthorizedKeysFile /home/runner/.ssh/devspace-authorized_keys
+          AuthorizedKeysFile /etc/ssh/devspace-authorized_keys
           AuthenticationMethods publickey
           PubkeyAuthentication yes
           PasswordAuthentication no
           KbdInteractiveAuthentication no
           PermitRootLogin no
           PermitEmptyPasswords no
-          AllowUsers runner
+          AllowUsers agent
+          # The image's /etc/environment points every login at runner's
+          # runtime directory, which breaks rootless podman.
+          SetEnv XDG_RUNTIME_DIR=/run/user/$(id -u agent)
           PermitTTY yes
           AllowAgentForwarding no
           AllowTcpForwarding no
@@ -167,7 +194,7 @@ jobs:
           }
           sleep 1
           health_check
-          printf 'OpenSSH is ready for runner@%s\n' "$(hostname --fqdn)"
+          printf 'OpenSSH is ready for agent@%s\n' "$(hostname --fqdn)"
           printf 'Tailscale IPv4: %s\n' "$tailscale_ip"
           started=$(date +%s)
           while (( $(date +%s) - started < duration_seconds )); do
