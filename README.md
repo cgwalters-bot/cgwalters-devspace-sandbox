@@ -90,6 +90,38 @@ The opencode and Claude Code agent CLIs are preinstalled globally with npm
 which Renovate keeps current via the shared bootc-dev configuration. Agent
 credentials are not provisioned.
 
+## Agent runs
+
+`.github/workflows/agent.yml` runs an agent CLI on one task, unattended, as
+the same unprivileged `agent` user, in its own `agent.slice`
+(`scripts/agent-lib.mjs`). The job has no `id-token` permission and no
+secrets. The agent's network access, including its rootless containers'
+(which run as its subordinate uids), goes only through a local proxy that
+allows the domains in `agent/egress-allowlist.txt`, and DNS is refused
+(`scripts/agent-egress.mjs`). `scripts/agent-isolation-check.mjs` verifies
+before every run that the agent can't use sudo, read the job's environment or
+files, resolve names, or reach anything else, also from a container on the
+host network.
+
+Devspaces and agent runs are for public repositories only: their logs and
+transcripts are public. `scripts/public-repo.mjs` refuses a target that
+GitHub doesn't confirm is public, failing closed, before anything is cloned
+and again before anything is uploaded (`scripts/check-uploads.mjs`).
+
+The condensed transcript streams into the job log in an `agent (condensed)`
+group, a summary table goes to the step summary, and the `agent-run` (90
+days) and `agent-transcript` (30 days) artifacts hold the rest, redacted by
+`agent/redact.mjs` and checked for anything secret-shaped before upload. The
+files and the dispatch inputs follow the
+[agent runs contract](https://github.com/cgwalters-bot/homegit/blob/main/docs/devspace-agent-runs.md),
+and homegit's `bot-runs` dispatches and reads the runs.
+
+Inference is a mock for now: `agent/mock-model.py` serves the Messages API
+locally and replays `agent/mock-conversation.json`, so a run needs no
+credentials. Only Claude Code is wired up. The `AGENT_RUNS_ON` repository
+variable replaces the RHEL runner label, e.g. with `ubuntu-24.04` on a fork
+that lacks those runners.
+
 ## TODO / roadmap
 
 - Later, support launching an agent that can work autonomously and push changes
